@@ -2,12 +2,13 @@
 
 # Multi-Account Switcher for Claude Code
 # Simple tool to manage and switch between multiple Claude Code accounts
+# Accounts are identified by their OAuth accountUuid
 
 set -euo pipefail
 
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
-readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
+readonly STATE_FILE="$BACKUP_DIR/state.json"
 
 # Get Claude configuration file path with fallback
 get_claude_config_path() {
@@ -30,32 +31,6 @@ validate_json() {
     if ! jq . "$file" >/dev/null 2>&1; then
         echo "Error: Invalid JSON in $file"
         return 1
-    fi
-}
-
-# Email validation function
-validate_email() {
-    local email="$1"
-    if [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Account identifier resolution function
-resolve_account_identifier() {
-    local identifier="$1"
-    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-        echo "$identifier"
-    else
-        local account_num
-        account_num=$(jq -r --arg email "$identifier" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
-        if [[ -n "$account_num" && "$account_num" != "null" ]]; then
-            echo "$account_num"
-        else
-            echo ""
-        fi
     fi
 }
 
@@ -126,21 +101,33 @@ wait_for_claude_close() {
     echo "Claude Code closed. Continuing..."
 }
 
-# Get current account info from .claude.json
-get_current_account() {
+# Get current account uuid from .claude.json
+get_current_uuid() {
     if [[ ! -f "$(get_claude_config_path)" ]]; then
-        echo "none"
+        echo ""
         return
     fi
 
     if ! validate_json "$(get_claude_config_path)"; then
-        echo "none"
+        echo ""
+        return
+    fi
+
+    local uuid
+    uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$(get_claude_config_path)" 2>/dev/null)
+    echo "${uuid:-}"
+}
+
+# Get current account email from .claude.json
+get_current_email() {
+    if [[ ! -f "$(get_claude_config_path)" ]]; then
+        echo ""
         return
     fi
 
     local email
     email=$(jq -r '.oauthAccount.emailAddress // empty' "$(get_claude_config_path)" 2>/dev/null)
-    echo "${email:-none}"
+    echo "${email:-}"
 }
 
 # Read credentials from Keychain
@@ -154,26 +141,23 @@ write_credentials() {
     security add-generic-password -U -s "Claude Code-credentials" -a "$USER" -w "$credentials" 2>/dev/null
 }
 
-# Read account credentials from Keychain
+# Read account credentials from Keychain (keyed by uuid)
 read_account_credentials() {
-    local account_num="$1"
-    local email="$2"
-    security find-generic-password -s "Claude Code-Account-${account_num}-${email}" -w 2>/dev/null || echo ""
+    local uuid="$1"
+    security find-generic-password -s "Claude Code-Account-${uuid}" -w 2>/dev/null || echo ""
 }
 
-# Write account credentials to Keychain
+# Write account credentials to Keychain (keyed by uuid)
 write_account_credentials() {
-    local account_num="$1"
-    local email="$2"
-    local credentials="$3"
-    security add-generic-password -U -s "Claude Code-Account-${account_num}-${email}" -a "$USER" -w "$credentials" 2>/dev/null
+    local uuid="$1"
+    local credentials="$2"
+    security add-generic-password -U -s "Claude Code-Account-${uuid}" -a "$USER" -w "$credentials" 2>/dev/null
 }
 
-# Read account config from backup
+# Read account config from backup (keyed by uuid)
 read_account_config() {
-    local account_num="$1"
-    local email="$2"
-    local config_file="$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
+    local uuid="$1"
+    local config_file="$BACKUP_DIR/configs/.claude-config-${uuid}.json"
 
     if [[ -f "$config_file" ]]; then
         cat "$config_file"
@@ -182,74 +166,94 @@ read_account_config() {
     fi
 }
 
-# Write account config to backup
+# Write account config to backup (keyed by uuid)
 write_account_config() {
-    local account_num="$1"
-    local email="$2"
-    local config="$3"
-    local config_file="$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
+    local uuid="$1"
+    local config="$2"
+    local config_file="$BACKUP_DIR/configs/.claude-config-${uuid}.json"
 
     printf '%s\n' "$config" > "$config_file"
     chmod 600 "$config_file"
 }
 
-# Initialize sequence.json if it doesn't exist
-init_sequence_file() {
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+# Initialize state.json if it doesn't exist
+init_state_file() {
+    if [[ ! -f "$STATE_FILE" ]]; then
         local init_content='{
-  "activeAccountNumber": null,
+  "activeAccount": null,
   "lastUpdated": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
   "sequence": [],
   "accounts": {}
 }'
-        write_json "$SEQUENCE_FILE" "$init_content"
+        write_json "$STATE_FILE" "$init_content"
     fi
 }
 
-# Get next account number
-get_next_account_number() {
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
-        echo "1"
+# Resolve uuid or uuid prefix to full uuid
+resolve_uuid() {
+    local identifier="$1"
+
+    # Exact uuid match
+    if jq -e --arg id "$identifier" '.accounts[$id]' "$STATE_FILE" >/dev/null 2>&1; then
+        echo "$identifier"
         return
     fi
 
-    local max_num
-    max_num=$(jq -r '.accounts | keys | map(tonumber) | max // 0' "$SEQUENCE_FILE")
-    echo $((max_num + 1))
+    # Partial uuid prefix match
+    local matches
+    matches=$(jq -r --arg prefix "$identifier" '[.accounts | keys[] | select(startswith($prefix))] | .[]' "$STATE_FILE" 2>/dev/null)
+    local match_count
+    match_count=$(printf '%s\n' "$matches" | grep -c . 2>/dev/null || echo "0")
+
+    if [[ "$match_count" -eq 1 ]]; then
+        echo "$matches"
+        return
+    elif [[ "$match_count" -gt 1 ]]; then
+        echo "Error: Ambiguous prefix '$identifier' matches $match_count accounts:" >&2
+        printf '%s\n' "$matches" | while read -r m; do
+            local email
+            email=$(jq -r --arg id "$m" '.accounts[$id].email' "$STATE_FILE")
+            echo "  ${m:0:8}… ($email)" >&2
+        done
+        echo ""
+        return
+    fi
+
+    echo ""
 }
 
-# Check if account exists by email
-account_exists() {
-    local email="$1"
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+# Check if account exists by uuid
+account_exists_by_uuid() {
+    local uuid="$1"
+    if [[ ! -f "$STATE_FILE" ]]; then
         return 1
     fi
 
-    jq -e --arg email "$email" '.accounts[] | select(.email == $email)' "$SEQUENCE_FILE" >/dev/null 2>&1
+    jq -e --arg id "$uuid" '.accounts[$id]' "$STATE_FILE" >/dev/null 2>&1
 }
 
 # Add account
 cmd_add_account() {
     setup_directories
-    init_sequence_file
+    init_state_file
 
-    local current_email
-    current_email=$(get_current_account)
+    local current_uuid
+    current_uuid=$(get_current_uuid)
 
-    if [[ "$current_email" == "none" ]]; then
+    if [[ -z "$current_uuid" ]]; then
         echo "Error: No active Claude account found. Please log in first."
         exit 1
     fi
 
-    if account_exists "$current_email"; then
-        echo "Account $current_email is already managed."
+    if account_exists_by_uuid "$current_uuid"; then
+        local existing_email
+        existing_email=$(jq -r --arg id "$current_uuid" '.accounts[$id].email' "$STATE_FILE")
+        echo "Account ${current_uuid:0:8}… ($existing_email) is already managed."
         exit 0
     fi
 
-    local account_num
-    account_num=$(get_next_account_number)
-
-    local current_creds current_config
+    local current_email current_creds current_config
+    current_email=$(get_current_email)
     current_creds=$(read_credentials)
     current_config=$(cat "$(get_claude_config_path)")
 
@@ -258,78 +262,57 @@ cmd_add_account() {
         exit 1
     fi
 
-    local account_uuid
-    account_uuid=$(jq -r '.oauthAccount.accountUuid' "$(get_claude_config_path)")
+    write_account_credentials "$current_uuid" "$current_creds"
+    write_account_config "$current_uuid" "$current_config"
 
-    write_account_credentials "$account_num" "$current_email" "$current_creds"
-    write_account_config "$account_num" "$current_email" "$current_config"
-
-    local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        .accounts[$num] = {
+    local updated_state
+    updated_state=$(jq --arg uuid "$current_uuid" --arg email "$current_email" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .accounts[$uuid] = {
             email: $email,
-            uuid: $uuid,
             added: $now
         } |
-        .sequence += [$num | tonumber] |
-        .activeAccountNumber = ($num | tonumber) |
+        .sequence += [$uuid] |
+        .activeAccount = $uuid |
         .lastUpdated = $now
-    ' "$SEQUENCE_FILE")
+    ' "$STATE_FILE")
 
-    write_json "$SEQUENCE_FILE" "$updated_sequence"
+    write_json "$STATE_FILE" "$updated_state"
 
-    echo "Added Account $account_num: $current_email"
+    echo "Added ${current_uuid:0:8}… ($current_email)"
 }
 
 # Remove account
 cmd_remove_account() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --remove-account <account_number|email>"
+        echo "Usage: $0 --remove-account <uuid>"
         exit 1
     fi
 
     local identifier="$1"
-    local account_num
 
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+    if [[ ! -f "$STATE_FILE" ]]; then
         echo "Error: No accounts are managed yet"
         exit 1
     fi
 
-    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-        account_num="$identifier"
-    else
-        if ! validate_email "$identifier"; then
-            echo "Error: Invalid email format: $identifier"
-            exit 1
-        fi
-
-        account_num=$(resolve_account_identifier "$identifier")
-        if [[ -z "$account_num" ]]; then
-            echo "Error: No account found with email: $identifier"
-            exit 1
-        fi
-    fi
-
-    local account_info
-    account_info=$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")
-
-    if [[ -z "$account_info" ]]; then
-        echo "Error: Account-$account_num does not exist"
+    local target_uuid
+    target_uuid=$(resolve_uuid "$identifier")
+    if [[ -z "$target_uuid" ]]; then
+        echo "Error: No account found for: $identifier"
         exit 1
     fi
 
     local email
-    email=$(printf '%s' "$account_info" | jq -r '.email')
+    email=$(jq -r --arg id "$target_uuid" '.accounts[$id].email' "$STATE_FILE")
 
     local active_account
-    active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    active_account=$(jq -r '.activeAccount' "$STATE_FILE")
 
-    if [[ "$active_account" == "$account_num" ]]; then
-        echo "Warning: Account-$account_num ($email) is currently active"
+    if [[ "$active_account" == "$target_uuid" ]]; then
+        echo "Warning: ${target_uuid:0:8}… ($email) is currently active"
     fi
 
-    echo -n "Are you sure you want to permanently remove Account-$account_num ($email)? [y/N] "
+    echo -n "Are you sure you want to permanently remove ${target_uuid:0:8}… ($email)? [y/N] "
     read -r confirm
 
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
@@ -337,32 +320,36 @@ cmd_remove_account() {
         exit 0
     fi
 
-    security delete-generic-password -s "Claude Code-Account-${account_num}-${email}" 2>/dev/null || true
-    rm -f "$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
+    security delete-generic-password -s "Claude Code-Account-${target_uuid}" 2>/dev/null || true
+    rm -f "$BACKUP_DIR/configs/.claude-config-${target_uuid}.json"
 
-    local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        del(.accounts[$num]) |
-        .sequence = (.sequence | map(select(. != ($num | tonumber)))) |
+    local updated_state
+    updated_state=$(jq --arg id "$target_uuid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        del(.accounts[$id]) |
+        .sequence = (.sequence | map(select(. != $id))) |
+        (if .activeAccount == $id then .activeAccount = null else . end) |
         .lastUpdated = $now
-    ' "$SEQUENCE_FILE")
+    ' "$STATE_FILE")
 
-    write_json "$SEQUENCE_FILE" "$updated_sequence"
+    write_json "$STATE_FILE" "$updated_state"
 
-    echo "Account-$account_num ($email) has been removed"
+    echo "${target_uuid:0:8}… ($email) has been removed"
 }
 
 # First-run setup workflow
 first_run_setup() {
-    local current_email
-    current_email=$(get_current_account)
+    local current_uuid
+    current_uuid=$(get_current_uuid)
 
-    if [[ "$current_email" == "none" ]]; then
+    if [[ -z "$current_uuid" ]]; then
         echo "No active Claude account found. Please log in first."
         return 1
     fi
 
-    echo -n "No managed accounts found. Add current account ($current_email) to managed list? [Y/n] "
+    local current_email
+    current_email=$(get_current_email)
+
+    echo -n "No managed accounts found. Add current account ($current_email)? [Y/n] "
     read -r response
 
     if [[ "$response" == "n" || "$response" == "N" ]]; then
@@ -376,145 +363,116 @@ first_run_setup() {
 
 # List accounts
 cmd_list() {
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+    if [[ ! -f "$STATE_FILE" ]]; then
         echo "No accounts are managed yet."
         first_run_setup
         exit 0
     fi
 
-    local current_email
-    current_email=$(get_current_account)
-
-    local active_account_num=""
-    if [[ "$current_email" != "none" ]]; then
-        active_account_num=$(jq -r --arg email "$current_email" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
-    fi
+    local current_uuid
+    current_uuid=$(get_current_uuid)
 
     echo "Accounts:"
-    jq -r --arg active "$active_account_num" '
-        .sequence[] as $num |
-        .accounts["\($num)"] |
-        if "\($num)" == $active then
-            "  \($num): \(.email[:5])… (active)"
-        else
-            "  \($num): \(.email[:5])…"
-        end
-    ' "$SEQUENCE_FILE"
+    jq -r --arg active "$current_uuid" '
+        .sequence[] as $uuid |
+        .accounts[$uuid] |
+        "\($uuid[:8])… \(.email)" + (if $uuid == $active then " (active)" else "" end) |
+        "  " + .
+    ' "$STATE_FILE"
 }
 
 # Switch to next account
 cmd_switch() {
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+    if [[ ! -f "$STATE_FILE" ]]; then
         echo "Error: No accounts are managed yet"
         exit 1
     fi
 
-    local current_email
-    current_email=$(get_current_account)
+    local current_uuid
+    current_uuid=$(get_current_uuid)
 
-    if [[ "$current_email" == "none" ]]; then
+    if [[ -z "$current_uuid" ]]; then
         echo "Error: No active Claude account found"
         exit 1
     fi
 
-    if ! account_exists "$current_email"; then
-        echo "Notice: Active account '$current_email' was not managed."
+    if ! account_exists_by_uuid "$current_uuid"; then
+        echo "Notice: Active account '${current_uuid:0:8}…' was not managed."
         cmd_add_account
-        local account_num
-        account_num=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-        echo "It has been automatically added as Account-$account_num."
+        echo "It has been automatically added."
         echo "Please run './ccswitch.sh --switch' again to switch to the next account."
         exit 0
     fi
 
     # wait_for_claude_close
 
-    local active_account
     local -a sequence
-    active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    sequence=("${(@f)$(jq -r '.sequence[]' "$SEQUENCE_FILE")}")
+    sequence=("${(@f)$(jq -r '.sequence[]' "$STATE_FILE")}")
 
     # Find current index (1-based) and compute next (zsh arrays are 1-indexed)
     local current_index=1
     for (( i=1; i<=${#sequence}; i++ )); do
-        if [[ "${sequence[$i]}" == "$active_account" ]]; then
+        if [[ "${sequence[$i]}" == "$current_uuid" ]]; then
             current_index=$i
             break
         fi
     done
 
-    local next_account
-    next_account="${sequence[$(( current_index % ${#sequence} + 1 ))]}"
+    local next_uuid
+    next_uuid="${sequence[$(( current_index % ${#sequence} + 1 ))]}"
 
-    perform_switch "$next_account"
+    perform_switch "$next_uuid"
 }
 
 # Switch to specific account
 cmd_switch_to() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --switch-to <account_number|email>"
+        echo "Usage: $0 --switch-to <uuid>"
         exit 1
     fi
 
     local identifier="$1"
-    local target_account
 
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+    if [[ ! -f "$STATE_FILE" ]]; then
         echo "Error: No accounts are managed yet"
         exit 1
     fi
 
-    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-        target_account="$identifier"
-    else
-        if ! validate_email "$identifier"; then
-            echo "Error: Invalid email format: $identifier"
-            exit 1
-        fi
-
-        target_account=$(resolve_account_identifier "$identifier")
-        if [[ -z "$target_account" ]]; then
-            echo "Error: No account found with email: $identifier"
-            exit 1
-        fi
-    fi
-
-    local account_info
-    account_info=$(jq -r --arg num "$target_account" '.accounts[$num] // empty' "$SEQUENCE_FILE")
-
-    if [[ -z "$account_info" ]]; then
-        echo "Error: Account-$target_account does not exist"
+    local target_uuid
+    target_uuid=$(resolve_uuid "$identifier")
+    if [[ -z "$target_uuid" ]]; then
+        echo "Error: No account found for: $identifier"
         exit 1
     fi
 
     # wait_for_claude_close
-    perform_switch "$target_account"
+    perform_switch "$target_uuid"
 }
 
 # Perform the actual account switch
 perform_switch() {
-    local target_account="$1"
+    local target_uuid="$1"
 
-    local current_account target_email current_email
-    current_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    target_email=$(jq -r --arg num "$target_account" '.accounts[$num].email' "$SEQUENCE_FILE")
-    current_email=$(get_current_account)
+    local current_uuid target_email current_email
+    current_uuid=$(get_current_uuid)
+    target_email=$(jq -r --arg id "$target_uuid" '.accounts[$id].email' "$STATE_FILE")
+    current_email=$(get_current_email)
 
     # Step 1: Backup current account
     local current_creds current_config
     current_creds=$(read_credentials)
     current_config=$(cat "$(get_claude_config_path)")
 
-    write_account_credentials "$current_account" "$current_email" "$current_creds"
-    write_account_config "$current_account" "$current_email" "$current_config"
+    write_account_credentials "$current_uuid" "$current_creds"
+    write_account_config "$current_uuid" "$current_config"
 
     # Step 2: Retrieve target account
     local target_creds target_config
-    target_creds=$(read_account_credentials "$target_account" "$target_email")
-    target_config=$(read_account_config "$target_account" "$target_email")
+    target_creds=$(read_account_credentials "$target_uuid")
+    target_config=$(read_account_config "$target_uuid")
 
     if [[ -z "$target_creds" || -z "$target_config" ]]; then
-        echo "Error: Missing backup data for Account-$target_account"
+        echo "Error: Missing backup data for ${target_uuid:0:8}…"
         exit 1
     fi
 
@@ -538,15 +496,15 @@ perform_switch() {
     write_json "$(get_claude_config_path)" "$merged_config"
 
     # Step 4: Update state
-    local updated_sequence
-    updated_sequence=$(jq --arg num "$target_account" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        .activeAccountNumber = ($num | tonumber) |
+    local updated_state
+    updated_state=$(jq --arg id "$target_uuid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .activeAccount = $id |
         .lastUpdated = $now
-    ' "$SEQUENCE_FILE")
+    ' "$STATE_FILE")
 
-    write_json "$SEQUENCE_FILE" "$updated_sequence"
+    write_json "$STATE_FILE" "$updated_state"
 
-    echo "Switched to Account-$target_account ($target_email)"
+    echo "Switched to ${target_uuid:0:8}… ($target_email)"
     cmd_list
     echo ""
     echo "Please restart Claude Code to use the new authentication."
@@ -559,20 +517,15 @@ show_usage() {
     echo "Usage: $0 [COMMAND]"
     echo ""
     echo "Commands:"
-    echo "  --add-account                    Add current account to managed accounts"
-    echo "  --remove-account <num|email>    Remove account by number or email"
-    echo "  --list                           List all managed accounts"
-    echo "  --switch                         Rotate to next account in sequence"
-    echo "  --switch-to <num|email>          Switch to specific account number or email"
-    echo "  --help                           Show this help message"
+    echo "  -a, --add-account            Add current account to managed accounts"
+    echo "  -r, --remove-account <uuid>  Remove account by uuid (or prefix)"
+    echo "  -l, --list                   List all managed accounts"
+    echo "  -s, --switch                 Rotate to next account in sequence"
+    echo "  -t, --switch-to <uuid>       Switch to account by uuid (or prefix)"
+    echo "  -h, --help                   Show this help message"
     echo ""
-    echo "Examples:"
-    echo "  $0 --add-account"
-    echo "  $0 --list"
-    echo "  $0 --switch"
-    echo "  $0 --switch-to 2"
-    echo "  $0 --switch-to user@example.com"
-    echo "  $0 --remove-account user@example.com"
+    echo "Accounts are identified by their OAuth accountUuid."
+    echo "You can use a uuid prefix (e.g., 'a1b2c3d4') instead of the full uuid."
 }
 
 # Main script logic
@@ -586,24 +539,24 @@ main() {
     check_dependencies
 
     case "${1:-}" in
-        --add-account)
+        -a|--add-account)
             cmd_add_account
             ;;
-        --remove-account)
+        -r|--remove-account)
             shift
             cmd_remove_account "$@"
             ;;
-        --list)
+        -l|--list)
             cmd_list
             ;;
-        --switch)
+        -s|--switch)
             cmd_switch
             ;;
-        --switch-to)
+        -t|--switch-to)
             shift
             cmd_switch_to "$@"
             ;;
-        --help)
+        -h|--help)
             show_usage
             ;;
         "")
