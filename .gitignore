@@ -1,2 +1,7 @@
 dep
 devpilot
+cursor-openai-bridge/
+opencode-plugin-cursor/
+setup.sh
+update_ezyaccess.sh
+.DS_Store
