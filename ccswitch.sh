@@ -381,6 +381,20 @@ cmd_list() {
     ' "$STATE_FILE"
 }
 
+# Show current active account
+cmd_current() {
+    local uuid email
+    uuid=$(get_current_uuid)
+    email=$(get_current_email)
+
+    if [[ -z "$uuid" ]]; then
+        echo "No active Claude account found."
+        exit 1
+    fi
+
+    echo "${uuid:0:8}… ($email)"
+}
+
 # Switch to next account
 cmd_switch() {
     if [[ ! -f "$STATE_FILE" ]]; then
@@ -517,6 +531,7 @@ show_usage() {
     echo "Usage: $0 [COMMAND]"
     echo ""
     echo "Commands:"
+    echo "  -c, --current                Show current active account"
     echo "  -a, --add-account            Add current account to managed accounts"
     echo "  -r, --remove-account <uuid>  Remove account by uuid (or prefix)"
     echo "  -l, --list                   List all managed accounts"
@@ -539,6 +554,9 @@ main() {
     check_dependencies
 
     case "${1:-}" in
+        -c|--current)
+            cmd_current
+            ;;
         -a|--add-account)
             cmd_add_account
             ;;
