@@ -395,9 +395,9 @@ cmd_list() {
         .sequence[] as $num |
         .accounts["\($num)"] |
         if "\($num)" == $active then
-            "  \($num): \(.email) (active)"
+            "  \($num): \(.email[:5])… (active)"
         else
-            "  \($num): \(.email)"
+            "  \($num): \(.email[:5])…"
         end
     ' "$SEQUENCE_FILE"
 }
@@ -607,7 +607,7 @@ main() {
             show_usage
             ;;
         "")
-            show_usage
+            cmd_switch
             ;;
         *)
             echo "Error: Unknown command '$1'"
