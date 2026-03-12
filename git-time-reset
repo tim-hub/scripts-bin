@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Check if number argument is provided
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <number> [date='now']"
+    exit 1
+fi
+
+# Assign the first argument to a variable
+number=$1
+
+# Assign the default or provided date argument to a variable
+if [ $# -eq 1 ]; then
+    date=$(date '+%Y-%m-%d %H:%M:%S')
+else
+    date=$2
+fi
+
+# Execute git rebase command with the provided number and date
+GIT_COMMITTER_DATE="$date"  git rebase HEAD~$number --exec "git commit --amend --no-edit --date '$date'"
